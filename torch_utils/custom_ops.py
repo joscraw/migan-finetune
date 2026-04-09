@@ -108,7 +108,12 @@ def get_plugin(module_name, sources, **build_kwargs):
                 verbose=verbose_build, sources=digest_sources, **build_kwargs)
         else:
             torch.utils.cpp_extension.load(name=module_name, verbose=verbose_build, sources=sources, **build_kwargs)
-        module = importlib.import_module(module_name)
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            # Modern PyTorch doesn't register JIT-compiled modules for importlib.
+            # Re-run load() which returns the compiled module directly.
+            module = torch.utils.cpp_extension.load(name=module_name, verbose=verbose_build, sources=sources, **build_kwargs)
 
     except:
         if verbosity == 'brief':
