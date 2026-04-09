@@ -108,7 +108,7 @@ class PerceptualLoss(nn.Module):
     def normalize(self, x):
         """Convert from [-1,1] (MI-GAN range) to ImageNet-normalized."""
         x = (x + 1) / 2  # [-1,1] -> [0,1]
-        return (x - self.mean) / self.std
+        return (x - self.mean.to(x.device)) / self.std.to(x.device)
 
     def forward(self, output, target):
         output = self.normalize(output)
