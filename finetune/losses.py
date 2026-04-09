@@ -1,9 +1,9 @@
 """
 Custom loss functions for MI-GAN fine-tuning.
 
-Adds identity loss and boundary loss ON TOP of MI-GAN's original adversarial
-training. The adversarial loss (discriminator) keeps output sharp. The new
-losses fix the boundary artifact.
+Uses MI-GAN's ORIGINAL trained discriminator (loaded from their .pkl checkpoint)
+for adversarial sharpness. Adds identity loss and boundary loss on top to fix
+the box artifact. Their stuff untouched, our additions layered on top.
 
 MI-GAN mask convention: 1 = known pixel, 0 = hole (to be filled).
 Image values: [-1, 1] range, sRGB.
@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 
 # ============================================================================
-# New losses (our additions)
+# Our additions (fix the boundary)
 # ============================================================================
 
 def reconstruction_loss(output, target, mask):
@@ -43,101 +43,54 @@ def boundary_loss(output, target, mask, width=5):
 
 
 # ============================================================================
-# Discriminator — keeps output sharp (PatchGAN with spectral normalization)
+# MI-GAN's original adversarial losses (same math they use)
 # ============================================================================
 
-class PatchDiscriminator(nn.Module):
+def discriminator_step(disc, real_img, fake_img, mask):
     """
-    PatchGAN discriminator. Outputs a grid of real/fake scores.
-    Spectral normalization for stable GAN training.
-
-    Input: 4 channels [mask - 0.5, composited_image]
-    Output: [B, 1, H/16, W/16] grid of logits
+    MI-GAN's discriminator loss: non-saturating logistic + R1 optional.
+    The discriminator sees composited images (real outside mask + generated inside).
+    Input format: [mask - 0.5, image] — 4 channels, same as their training.
     """
-
-    def __init__(self, in_channels=4, base_channels=64):
-        super().__init__()
-
-        def disc_block(in_ch, out_ch, stride=2):
-            return nn.Sequential(
-                nn.utils.spectral_norm(
-                    nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=stride, padding=1, bias=False)
-                ),
-                nn.LeakyReLU(0.2, inplace=True),
-            )
-
-        ch = base_channels
-        self.model = nn.Sequential(
-            # No spectral norm on first layer (standard practice)
-            nn.Conv2d(in_channels, ch, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.LeakyReLU(0.2, inplace=True),
-            disc_block(ch, ch * 2),       # 64 -> 128
-            disc_block(ch * 2, ch * 4),   # 128 -> 256
-            disc_block(ch * 4, ch * 8, stride=1),  # 256 -> 512, no downsample
-            nn.utils.spectral_norm(
-                nn.Conv2d(ch * 8, 1, kernel_size=4, stride=1, padding=1, bias=False)
-            ),
-        )
-
-    def forward(self, x):
-        return self.model(x)
-
-
-def discriminator_loss(discriminator, real_img, fake_img, mask):
-    """
-    Hinge loss for the discriminator.
-    Sees composited images: real pixels outside mask + generated inside.
-    """
-    # Composite: real pixels in known region, generated in hole
     hole = 1.0 - mask
-    fake_composite = fake_img * hole + real_img * mask
+    fake_composite = fake_img.detach() * hole + real_img * mask
 
-    # Discriminator input: [mask - 0.5, image]
+    # Discriminator inputs
     real_input = torch.cat([mask - 0.5, real_img], dim=1)
-    fake_input = torch.cat([mask - 0.5, fake_composite.detach()], dim=1)
+    fake_input = torch.cat([mask - 0.5, fake_composite], dim=1)
 
-    real_logits = discriminator(real_input)
-    fake_logits = discriminator(fake_input)
+    real_logits = disc(real_input)
+    fake_logits = disc(fake_input)
 
-    # Hinge loss
-    d_loss = F.relu(1.0 - real_logits).mean() + F.relu(1.0 + fake_logits).mean()
+    # Non-saturating logistic loss (same as MI-GAN/StyleGAN2)
+    d_loss = F.softplus(-real_logits).mean() + F.softplus(fake_logits).mean()
 
     return d_loss
 
 
-def generator_adversarial_loss(discriminator, fake_img, real_img, mask):
-    """
-    Non-saturating adversarial loss for the generator.
-    Pushes the generator to fool the discriminator → sharp output.
-    """
-    hole = 1.0 - mask
-    fake_composite = fake_img * hole + real_img * mask
-    fake_input = torch.cat([mask - 0.5, fake_composite], dim=1)
-    fake_logits = discriminator(fake_input)
-
-    # Non-saturating: maximize fake logits
-    g_loss = F.softplus(-fake_logits).mean()
-
-    return g_loss
-
-
-def r1_penalty(discriminator, real_img, mask):
-    """
-    R1 gradient penalty — regularizes the discriminator.
-    Standard in StyleGAN/MI-GAN training.
-    """
+def r1_penalty(disc, real_img, mask):
+    """R1 gradient penalty — same as MI-GAN's Dreg."""
     real_img = real_img.detach().requires_grad_(True)
     real_input = torch.cat([mask - 0.5, real_img], dim=1)
-    real_logits = discriminator(real_input)
-
+    real_logits = disc(real_input)
     grad = torch.autograd.grad(
         outputs=real_logits.sum(),
         inputs=real_img,
         create_graph=True
     )[0]
+    return grad.square().sum(dim=[1, 2, 3]).mean()
 
-    penalty = grad.square().sum(dim=[1, 2, 3]).mean()
-    return penalty
+
+def generator_adversarial_loss(disc, fake_img, real_img, mask):
+    """
+    MI-GAN's generator adversarial loss: non-saturating logistic.
+    This is what keeps the output SHARP.
+    """
+    hole = 1.0 - mask
+    fake_composite = fake_img * hole + real_img * mask
+    fake_input = torch.cat([mask - 0.5, fake_composite], dim=1)
+    fake_logits = disc(fake_input)
+    return F.softplus(-fake_logits).mean()
 
 
 # ============================================================================
@@ -149,17 +102,11 @@ class PerceptualLoss(nn.Module):
         super().__init__()
         from torchvision.models import vgg16, VGG16_Weights
         vgg = vgg16(weights=VGG16_Weights.DEFAULT).features.to(device).eval()
-
         self.blocks = nn.ModuleList([
-            vgg[:4],   # relu1_2
-            vgg[4:9],  # relu2_2
-            vgg[9:16], # relu3_3
-            vgg[16:23] # relu4_3
+            vgg[:4], vgg[4:9], vgg[9:16], vgg[16:23]
         ])
-
         for param in self.parameters():
             param.requires_grad = False
-
         self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
